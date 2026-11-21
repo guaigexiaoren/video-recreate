@@ -1,0 +1,14 @@
+{
+  "api_key": "",
+  "base_url": "https://api.88api.ai",
+  "analysis_model": "",
+  "image_model": "doubao-seedream-5-0-pro",
+  "video_model": "doubao-seedance-2.5",
+  "output_dir": "outputs",
+  "git_bash": "C:/Program Files/Git/bin/bash.exe",
+  "ffmpeg_dir": "C:/Users/YYMY/tools/bin",
+  "whisper_model": "small",
+  "video_ratio": "9:16",
+  "video_resolution": "1080p",
+  "video_duration": 5
+}
