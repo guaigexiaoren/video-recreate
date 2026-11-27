@@ -99,8 +99,11 @@ class Api88:
     def create_video(self, model: str, prompt: str, duration: int = 5,
                      ratio: str = "9:16", first_frame: str | None = None,
                      images: list[str] | None = None,
-                     negative_prompt: str | None = None) -> str:
+                     negative_prompt: str | None = None,
+                     resolution: str | None = None) -> str:
         body = {"model": model, "prompt": prompt, "duration": duration, "ratio": ratio}
+        if resolution:
+            body["resolution"] = str(resolution).lower()
         # Seedance 等模型的首帧与普通参考图互斥，因此首帧优先且不再传 images
         if first_frame:
             body["metadata"] = {"firstFrame": first_frame}

@@ -74,6 +74,10 @@ if ($LASTEXITCODE -ne 0) { throw "升级 pip 失败" }
 if ($LASTEXITCODE -ne 0) { throw "安装构建依赖失败" }
 
 Write-Host "== 2/8 PyInstaller 打包 =="
+Get-CimInstance Win32_Process -Filter "Name = 'msedge.exe'" |
+    Where-Object { $_.CommandLine -like "*$Dist*edge-profile*" } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+Start-Sleep -Milliseconds 500
 if (Test-Path $Dist) { Remove-Item -Recurse -Force $Dist }
 if (Test-Path (Join-Path $Build "pyi")) { Remove-Item -Recurse -Force (Join-Path $Build "pyi") }
 Push-Location $Root
@@ -92,6 +96,7 @@ Copy-Item (Join-Path $Root "app.py") (Join-Path $App "app.py") -Force
 Copy-Tree (Join-Path $Root "core") (Join-Path $App "core") @("__pycache__") @("*.pyc")
 Copy-Tree (Join-Path $Root "assets") (Join-Path $App "assets")
 Copy-Tree (Join-Path $Root ".streamlit") (Join-Path $App ".streamlit")
+Copy-Tree (Join-Path $Root ".streamlit") (Join-Path $Dist ".streamlit")
 
 Write-Host "== 4/8 复制外部工具 =="
 New-Item -ItemType Directory -Force $Bin | Out-Null

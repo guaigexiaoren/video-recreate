@@ -26,6 +26,7 @@ DEFAULTS = {
     "whisper_model": "small",
     "video_ratio": "9:16",
     "video_resolution": "1080p",
+    "video_generation_resolution": "720p",
     "video_duration": 5,
 }
 

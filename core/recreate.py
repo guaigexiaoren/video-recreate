@@ -29,7 +29,8 @@ def _parse_json(text: str) -> dict:
 
 def analyze_shots(api: Api88, model: str, frames: list[tuple[float, Path]],
                   mode: str, user_request: str = "", transcript: list[dict] | None = None,
-                  refs: list[dict] | None = None) -> tuple[list[dict], str]:
+                  refs: list[dict] | None = None,
+                  anchor: str = "") -> tuple[list[dict], str]:
     """返回 (shots, 原始模型输出)。参考图先于原片帧传入。"""
     mode_spec = load_mode(mode)
     mode_rule = mode_spec.get("analysis_prompt") or mode_spec.get("label", "")
@@ -48,8 +49,18 @@ def analyze_shots(api: Api88, model: str, frames: list[tuple[float, Path]],
         order_note = (
             f"第 1~{offset} 张是用户参考图；第 {offset + 1} 张起是按时间抽取的原片帧。"
         )
+        ref_note = (
+            "参考图是用户提供的人物、产品或风格依据：写每镜 prompt 时，"
+            "人物/产品按参考图描述，风格图则沿用其画风；不要照抄原片里的人物/产品外观。"
+            "reference 里填用到的 @别名。"
+        )
     else:
         order_note = "本次没有参考图，所有附图都是原片帧。"
+        ref_note = ""
+    anchor_rule = (
+        "每镜 prompt 必须体现「全片统一设定」中的人物/产品/风格；"
+        if anchor.strip() else ""
+    )
     lines = "\n".join(f"[{s['start']:.1f}-{s['end']:.1f}] {s['text']}" for s in (transcript or []))
 
     prompt = f"""你是短视频导演。请根据按时间顺序抽取的参考视频帧，拆解出可复刻的分镜。
@@ -68,8 +79,13 @@ def analyze_shots(api: Api88, model: str, frames: list[tuple[float, Path]],
 本次二创档位规则：
 {mode_rule}
 
+全片统一设定（必须贯穿所有镜头）：
+{anchor.strip() or "（无）"}
+
 用户额外要求：
 {user_request or "（无）"}
+
+{ref_note}
 
 只输出一个 JSON 对象，不要解释，格式严格如下：
 {{
@@ -88,7 +104,7 @@ def analyze_shots(api: Api88, model: str, frames: list[tuple[float, Path]],
     }}
   ]
 }}
-要求：reference 只能使用上面列出的 @别名，不要编造；镜头按时间顺序；duration 等于 end-start；每镜 2-8 秒；至少 1 个镜头。"""
+要求：{anchor_rule}reference 只能使用上面列出的 @别名，不要编造；镜头按时间顺序；duration 等于 end-start；每镜 2-8 秒；至少 1 个镜头。"""
 
     images = [ref["abs_path"] for ref in refs] + [str(p) for _, p in frames]
     text = api.chat_vision(model, prompt, images, temperature=0.4, max_tokens=6000)
@@ -167,7 +183,8 @@ def image_prompt(shot: dict, anchor: str, ratio: str) -> str:
     return f"{text} {suffix}"
 
 
-def video_prompt(shot: dict, ref_aliases: list[str] | None = None) -> str:
+def video_prompt(shot: dict, ref_aliases: list[str] | None = None,
+                 anchor: str = "") -> str:
     text = shot.get("prompt") or shot.get("description", "")
     camera = shot.get("camera", "")
     dialogue = shot.get("dialogue", "")
@@ -181,5 +198,7 @@ def video_prompt(shot: dict, ref_aliases: list[str] | None = None) -> str:
             f"第 {i} 张=@{alias}" for i, alias in enumerate(ref_aliases, 1)
         )
         extra.append(f"参考图顺序：{order}")
+    if anchor.strip():
+        extra.append(f"全片统一设定：{anchor.strip()}")
     extra.append(f"时长约 {shot.get('duration', 5)} 秒")
     return text + "。" + "；".join(extra) + "。"

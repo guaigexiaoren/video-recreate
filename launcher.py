@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import http.client
+import json
 import os
 import socket
 import subprocess
@@ -287,6 +288,28 @@ def run_webview(proc: subprocess.Popen, port: int, log_handle) -> None:
         run_edge(proc, port)
 
 
+def prepare_edge_profile() -> None:
+    """关闭 Edge 自带翻译，避免本地页面被当成英文而弹出翻译提示。"""
+    prefs = DATA_DIR / "edge-profile" / "Default" / "Preferences"
+    prefs.parent.mkdir(parents=True, exist_ok=True)
+    data: dict = {}
+    if prefs.is_file():
+        try:
+            loaded = json.loads(prefs.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            data = {}
+    translate = data.get("translate")
+    if not isinstance(translate, dict):
+        translate = {}
+    if translate.get("enabled") is False:
+        return
+    translate["enabled"] = False
+    data["translate"] = translate
+    prefs.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+
 def run_edge(proc: subprocess.Popen, port: int) -> None:
     if not wait_health(proc, port):
         message_box(
@@ -298,10 +321,15 @@ def run_edge(proc: subprocess.Popen, port: int) -> None:
         message_box("找不到 Microsoft Edge，请安装 WebView2 或 Edge 后重试。")
         return
     url = f"http://127.0.0.1:{port}"
+    prepare_edge_profile()
     edge_proc = subprocess.Popen([
         str(edge), f"--app={url}",
         f"--user-data-dir={DATA_DIR / 'edge-profile'}",
         "--no-first-run", "--no-default-browser-check",
+        "--disable-translate",
+        "--disable-features=Translate,TranslateUI,msEdgeTranslate",
+        "--disable-background-mode",
+        "--lang=zh-CN",
         "--window-size=1440,900",
     ])
     edge_proc.wait()

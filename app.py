@@ -14,9 +14,16 @@ import streamlit as st
 from core import analyze, config, dedup, downloader, jobs, media, recreate
 from core.api88 import Api88, Api88Error, pick_models
 
-st.set_page_config(page_title="视频复刻工作台", page_icon="🎬", layout="wide")
+st.set_page_config(
+    page_title="视频复刻工作台", page_icon=":material/movie:", layout="wide"
+)
 cfg = config.load_config()
-OUTPUT_ROOT = jobs.resolve_output_root(cfg)
+
+
+def output_root() -> Path:
+    return jobs.resolve_output_root({
+        "output_dir": st.session_state.get("cfg_output_dir", cfg["output_dir"])
+    })
 
 MODES = ["conservative", "medium", "bold"]
 MODE_LABELS = {
@@ -59,6 +66,10 @@ API_STATUS_LABELS = {
 }
 MAX_REF_BYTES = 6 * 1024 * 1024
 MAX_REF_TOTAL = 12 * 1024 * 1024
+NO_MODEL_OPTION = "（先拉取模型）"
+MODEL_SENTINELS = {
+    "", "未选择", "请选择模型", "请选择或输入模型", "None", NO_MODEL_OPTION,
+}
 
 EDITOR_COLS = [
     "id", "start", "end", "duration", "semantic_function",
@@ -101,6 +112,7 @@ st.session_state.setdefault("upload_nonce", 0)
 st.session_state.setdefault("preview_section", "素材")
 st.session_state.setdefault("task_search", "")
 st.session_state.setdefault("search_open", False)
+st.session_state.setdefault("search_nonce", 0)
 st.session_state.setdefault("cfg_api_key", cfg["api_key"])
 st.session_state.setdefault("cfg_base_url", cfg["base_url"])
 st.session_state.setdefault("cfg_analysis_model", cfg["analysis_model"])
@@ -108,6 +120,9 @@ st.session_state.setdefault("cfg_image_model", cfg["image_model"])
 st.session_state.setdefault("cfg_video_model", cfg["video_model"])
 st.session_state.setdefault("cfg_ratio", cfg["video_ratio"])
 st.session_state.setdefault("cfg_resolution", cfg.get("video_resolution", "1080p"))
+st.session_state.setdefault(
+    "cfg_video_resolution", cfg.get("video_generation_resolution", "720p")
+)
 st.session_state.setdefault("cfg_duration", int(cfg["video_duration"]))
 st.session_state.setdefault("cfg_whisper", cfg["whisper_model"])
 st.session_state.setdefault("cfg_git_bash", cfg["git_bash"])
@@ -141,6 +156,7 @@ def reset_business_state() -> None:
 def start_draft() -> None:
     reset_business_state()
     st.session_state.active_job = ""
+    set_preview("素材")
     st.session_state.nonce += 1
     st.session_state.task_token = f"draft_{st.session_state.nonce}"
 
@@ -165,10 +181,13 @@ def current_dir() -> Path | None:
 
 def ensure_job_dir() -> Path:
     path = current_dir()
-    if path is not None:
-        return path
-    path = jobs.make_job_dir(OUTPUT_ROOT)
-    st.session_state.job_dir = str(path)
+    if path is None:
+        path = jobs.make_job_dir(output_root())
+        st.session_state.job_dir = str(path)
+    if st.session_state.get("active_job") != path.name:
+        st.session_state.active_job = path.name
+        st.session_state.nonce += 1
+        st.session_state.task_token = f"{path.name}_{st.session_state.nonce}"
     return path
 
 
@@ -192,6 +211,10 @@ def safe_filename(name: str) -> str:
 
 def flash(kind: str, message: str) -> None:
     st.session_state["_flash"] = (kind, message)
+
+
+def set_preview(section: str) -> None:
+    st.session_state["_preview_target"] = section
 
 
 def show_flash() -> None:
@@ -240,20 +263,27 @@ def model_label(model: str) -> str:
 def model_picker(label: str, key: str, default: str, kind: str) -> str | None:
     options = pick_models(st.session_state.models, kind)
     current = st.session_state.get(key, default)
+    if current in MODEL_SENTINELS:
+        current = ""
     if not current and options:
         current = options[0]
     choices = sorted({*options, *([current] if current else [])})
     if choices:
         if st.session_state.get(key) not in choices:
             st.session_state[key] = current or choices[0]
-        return st.selectbox(
+        value = st.selectbox(
             label, choices, key=key, placeholder="请选择模型",
             format_func=model_label, accept_new_options=True, width="stretch",
         )
-    return st.selectbox(
-        label, [], key=key, placeholder="请选择或输入模型",
-        format_func=model_label, accept_new_options=True, width="stretch",
+        return (value or "").strip() or None
+    st.session_state.pop(key, None)
+    value = st.selectbox(
+        label, [NO_MODEL_OPTION], key=key, index=None,
+        placeholder="先拉取模型，或直接输入模型 ID",
+        accept_new_options=True, width="stretch",
     )
+    value = (value or "").strip()
+    return None if value in MODEL_SENTINELS else (value or None)
 
 
 @st.cache_data(show_spinner=False)
@@ -271,7 +301,7 @@ def safe_probe(path: Path) -> dict | None:
 def rel_to_job(path: Path) -> str:
     folder = current_dir()
     try:
-        return str(Path(path).resolve().relative_to(folder.resolve()))
+        return Path(path).resolve().relative_to(folder.resolve()).as_posix()
     except (AttributeError, ValueError):
         return ""
 
@@ -398,13 +428,42 @@ def ref_data_url(path: Path) -> str:
     return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
 
 
+def shot_ref_payload(shot: dict) -> tuple[list[dict], list[str], list[str]]:
+    """按分镜里的 @别名取参考图，返回（有效参考图、data URL、警告）。"""
+    matched = recreate.match_shot_refs(shot, st.session_state.refs)
+    used, urls, warnings, total = [], [], [], 0
+    for ref in matched:
+        try:
+            size = Path(ref["abs_path"]).stat().st_size
+            if total + size > MAX_REF_TOTAL:
+                raise ValueError("参考图总大小超过 12MB")
+            url = ref_data_url(Path(ref["abs_path"]))
+        except Exception as exc:
+            warnings.append(f"@{ref['alias']} 跳过：{exc}")
+            continue
+        total += size
+        used.append(ref)
+        urls.append(url)
+    return used, urls, warnings
+
+
+def _clean_model(value: str | None) -> str:
+    return "" if value in MODEL_SENTINELS else (value or "").strip()
+
+
 def collect_config() -> dict:
     return {
         "api_key": st.session_state.get("cfg_api_key", cfg["api_key"]),
         "base_url": st.session_state.get("cfg_base_url", cfg["base_url"]),
-        "analysis_model": st.session_state.get("cfg_analysis_model", cfg["analysis_model"]),
-        "image_model": st.session_state.get("cfg_image_model", cfg["image_model"]),
-        "video_model": st.session_state.get("cfg_video_model", cfg["video_model"]),
+        "analysis_model": _clean_model(
+            st.session_state.get("cfg_analysis_model", cfg["analysis_model"])
+        ),
+        "image_model": _clean_model(
+            st.session_state.get("cfg_image_model", cfg["image_model"])
+        ),
+        "video_model": _clean_model(
+            st.session_state.get("cfg_video_model", cfg["video_model"])
+        ),
         "output_dir": st.session_state.get("cfg_output_dir", cfg["output_dir"]),
         "git_bash": st.session_state.get("cfg_git_bash", cfg["git_bash"]),
         "ffmpeg_dir": st.session_state.get("cfg_ffmpeg_dir", cfg["ffmpeg_dir"]),
@@ -413,17 +472,16 @@ def collect_config() -> dict:
         "video_resolution": st.session_state.get(
             "cfg_resolution", cfg.get("video_resolution", "1080p")
         ),
+        "video_generation_resolution": st.session_state.get(
+            "cfg_video_resolution", cfg.get("video_generation_resolution", "720p")
+        ),
         "video_duration": st.session_state.get("cfg_duration", cfg["video_duration"]),
     }
 
 
 LAYOUT_HTML = """
 <style>
-  [data-testid="stToolbar"] {
-    display: none !important;
-  }
   [data-testid="stMainBlockContainer"] {
-    padding-top: 4rem !important;
     padding-left: clamp(var(--size-3, 1rem), 2vw, var(--size-7, 2rem)) !important;
     padding-right: clamp(var(--size-3, 1rem), 2vw, var(--size-7, 2rem)) !important;
   }
@@ -442,6 +500,46 @@ LAYOUT_HTML = """
   .st-key-sec_compose {
     border-radius: var(--radius-3, 1rem);
     box-shadow: var(--shadow-1, 0 1px 2px rgba(0, 0, 0, .06));
+  }
+
+  /* 任务行：名称统一左对齐，避免主/次按钮文字位置跳动 */
+  [class*="st-key-open_"] button > div {
+    justify-content: flex-start !important;
+  }
+  [class*="st-key-open_"] button p {
+    width: 100%;
+    text-align: left !important;
+  }
+  [data-testid="stSidebar"] hr {
+    opacity: .55;
+  }
+  [data-testid="stSidebarCollapseButton"] {
+    visibility: visible !important;
+  }
+
+  /* 设置固定在左栏底部 */
+  [data-testid="stSidebarUserContent"] > div {
+    display: flex;
+    flex-direction: column;
+    min-height: calc(100vh - 5rem);
+  }
+  [data-testid="stSidebarUserContent"] > div > [data-testid="stVerticalBlock"] {
+    display: flex;
+    flex-direction: column;
+    flex: 1 1 auto;
+    min-height: calc(100vh - 5rem);
+  }
+  .st-key-sidebar_footer {
+    flex: 0 0 auto !important;
+    padding-top: .35rem;
+    background: #EEF1F4;
+    position: sticky;
+    bottom: 0;
+    z-index: 2;
+  }
+  [data-testid="stSidebarUserContent"]
+    [data-testid="stLayoutWrapper"]:has(.st-key-sidebar_footer) {
+    margin-top: auto !important;
   }
 
   /* 上传器中文化 */
@@ -547,6 +645,23 @@ def open_props_css() -> str:
 
 def inject_layout() -> None:
     st.html(f"<style>{open_props_css()}</style>" + LAYOUT_HTML)
+    st.html(
+        """
+        <script>
+        (() => {
+          document.documentElement.lang = "zh-CN";
+          document.documentElement.setAttribute("translate", "no");
+          if (!document.querySelector('meta[name="google"]')) {
+            const meta = document.createElement("meta");
+            meta.name = "google";
+            meta.content = "notranslate";
+            document.head.appendChild(meta);
+          }
+        })();
+        </script>
+        """,
+        unsafe_allow_javascript=True,
+    )
 
 
 # ================= 任务切换 / 历史操作 =================
@@ -557,28 +672,34 @@ def new_task_cb() -> None:
 
 def open_job_cb(jid: str) -> None:
     try:
-        state = jobs.load_job_state(OUTPUT_ROOT / jid)
+        state = jobs.load_job_state(output_root() / jid)
     except Exception as exc:
         flash("error", f"打开任务失败：{exc}")
         return
     reset_business_state()
     for key, value in state.items():
         st.session_state[key] = value
-    st.session_state.job_dir = str(OUTPUT_ROOT / jid)
+    st.session_state.job_dir = str(output_root() / jid)
     st.session_state.active_job = jid
     st.session_state.nonce += 1
     st.session_state.task_token = f"{jid}_{st.session_state.nonce}"
     add_log(f"打开任务：{state['meta'].get('name') or jid}")
 
 
+def sync_search() -> None:
+    key = f"task_search_{st.session_state.search_nonce}"
+    st.session_state.task_search = st.session_state.get(key, "")
+
+
 def clear_search_cb() -> None:
     st.session_state.task_search = ""
+    st.session_state.search_nonce += 1
     st.session_state.search_open = False
 
 
 @st.dialog("重命名任务")
 def rename_dialog(jid: str) -> None:
-    folder = OUTPUT_ROOT / jid
+    folder = output_root() / jid
     old = jobs.read_meta(folder)
     with st.form(f"rename_form_{jid}"):
         name = st.text_input("任务名称", value=old.get("name") or jid, max_chars=80)
@@ -597,7 +718,7 @@ def rename_dialog(jid: str) -> None:
 
 @st.dialog("删除任务")
 def delete_dialog(jid: str) -> None:
-    folder = OUTPUT_ROOT / jid
+    folder = output_root() / jid
     old = jobs.read_meta(folder)
     title = old.get("name") or jid
     st.warning(f"将永久删除任务「{title}」及全部文件，无法恢复。")
@@ -605,7 +726,7 @@ def delete_dialog(jid: str) -> None:
     if c1.button("确认删除", type="primary", key=f"dialog_delete_ok_{jid}", width="stretch"):
         is_current = st.session_state.active_job == jid
         try:
-            jobs.delete_job(OUTPUT_ROOT, folder)
+            jobs.delete_job(output_root(), folder)
         except Exception as exc:
             st.error(f"删除失败：{exc}")
             return
@@ -673,10 +794,13 @@ with st.sidebar:
             "", icon=":material/search:", help="搜索任务", key="search_open",
             on_change="rerun", width="content",
         ):
+            search_key = f"task_search_{st.session_state.search_nonce}"
+            if search_key not in st.session_state:
+                st.session_state[search_key] = st.session_state.get("task_search", "")
             st.text_input(
-                "搜索任务", key="task_search", type="search",
+                "搜索任务", key=search_key, type="search",
                 placeholder="任务名 / 日期 / 文件名",
-                label_visibility="collapsed",
+                label_visibility="collapsed", on_change=sync_search,
             )
             st.button(
                 "清除并关闭", icon=":material/close:", width="stretch",
@@ -685,7 +809,7 @@ with st.sidebar:
 
     query = (st.session_state.get("task_search") or "").strip()
     folded = query.casefold()
-    all_jobs = jobs.list_jobs(OUTPUT_ROOT)
+    all_jobs = jobs.list_jobs(output_root())
     shown = [
         job for job in all_jobs
         if not folded
@@ -727,13 +851,14 @@ with st.sidebar:
                 elif choice == "删除":
                     pending_dialog = ("delete", job["id"])
                 elif choice == "打开文件夹":
-                    open_folder(OUTPUT_ROOT / job["id"])
+                    open_folder(output_root() / job["id"])
 
-    st.divider()
-    if st.button(
-        "设置", icon=":material/settings:", width="stretch", key="btn_settings"
-    ):
-        pending_dialog = ("settings", "")
+    with st.container(key="sidebar_footer"):
+        st.divider()
+        if st.button(
+            "设置", icon=":material/settings:", width="stretch", key="btn_settings"
+        ):
+            pending_dialog = ("settings", "")
 
 if pending_dialog:
     action, jid = pending_dialog
@@ -764,14 +889,18 @@ def render_material(folder: Path | None) -> None:
 
 def render_shot_preview(folder: Path | None) -> None:
     shots = st.session_state.shots
-    if not shots:
+    frames = st.session_state.frames
+    if not shots and not frames:
         st.caption("暂无分镜。先在中间完成拆解。")
         return
-    total = sum(float(shot.get("duration") or 0) for shot in shots)
-    st.caption(
-        f"{len(shots)} 个镜头 · 约 {total:.1f}s · "
-        f"已生成 {len(st.session_state.clips)} 段视频"
-    )
+    if shots:
+        total = sum(float(shot.get("duration") or 0) for shot in shots)
+        st.caption(
+            f"{len(shots)} 个镜头 · 约 {total:.1f}s · "
+            f"已生成 {len(st.session_state.clips)} 段视频"
+        )
+    elif frames:
+        st.caption(f"已抽帧 {len(frames)} 张，等待拆解生成分镜。")
     keyframes = st.session_state.keyframe_urls
     items = []
     for shot in shots:
@@ -786,7 +915,6 @@ def render_shot_preview(folder: Path | None) -> None:
         for i, (sid, src) in enumerate(items):
             with cols[i % 2]:
                 st.image(src, caption=sid, width="stretch", alt=f"关键帧 {sid}")
-    frames = st.session_state.frames
     if frames:
         with st.expander(f"抽帧预览（{len(frames)}）"):
             cols = st.columns(2)
@@ -821,9 +949,12 @@ def render_logs() -> None:
 
 def render_preview() -> None:
     folder = current_dir()
-    st.subheader("预览")
+    st.subheader("预览", icon=":material/preview:")
     status_label, status_color = jobs.job_status(folder) if folder else ("未开始", "gray")
     st.badge(status_label, color=status_color)
+    target = st.session_state.pop("_preview_target", None)
+    if target in PREVIEW_OPTIONS:
+        st.session_state.preview_section = target
     section = st.segmented_control(
         "预览内容", PREVIEW_OPTIONS, required=True,
         key="preview_section", label_visibility="collapsed",
@@ -853,10 +984,14 @@ center, right = st.columns([2, 1.3], gap="large")
 with center:
     # ---------- 01 获取素材 ----------
     with st.container(border=True, key="sec_material"):
-        st.subheader("01 获取素材")
-        col_link, col_upload = st.columns([1.7, 1], gap="medium")
+        st.subheader("01 获取素材", icon=":material/download:")
+        st.session_state.setdefault("material_method", "链接下载")
+        material_method = st.segmented_control(
+            "获取方式", ["链接下载", "本地上传"], required=True,
+            key="material_method", width="stretch",
+        ) or "链接下载"
 
-        with col_link:
+        if material_method == "链接下载":
             with st.container(horizontal=True, vertical_alignment="bottom", wrap=False):
                 url = st.text_input(
                     "粘贴视频链接", key=tkey("url"),
@@ -886,15 +1021,14 @@ with center:
                         )
                         auto_name_from_source(path)
                         st.session_state.meta = jobs.read_meta(folder)
-                        st.session_state.preview_section = "素材"
+                        set_preview("素材")
                         add_log(f"下载完成：{path.name}")
                         flash("success", f"已下载：{path.name}")
                         st.rerun()
                     except Exception as exc:
                         add_log(f"下载失败：{exc}")
                         st.error(str(exc))
-
-        with col_upload:
+        else:
             uploaded = st.file_uploader(
                 "上传本地视频", type=["mp4", "mov", "mkv", "webm"],
                 key=f"{tkey('upload')}_{st.session_state.upload_nonce}",
@@ -910,7 +1044,7 @@ with center:
                 auto_name_from_source(dest)
                 st.session_state.meta = jobs.read_meta(folder)
                 st.session_state.upload_nonce += 1
-                st.session_state.preview_section = "素材"
+                set_preview("素材")
                 add_log(f"上传素材：{dest.name}")
                 flash("success", f"已保存：{dest.name}")
                 st.rerun()
@@ -926,21 +1060,29 @@ with center:
 
     # ---------- 02 拆解复刻 ----------
     with st.container(border=True, key="sec_recreate"):
-        st.subheader("02 拆解复刻")
+        st.subheader("02 拆解复刻", icon=":material/auto_awesome:")
 
         st.markdown("**复刻设定**")
-        c1, c2 = st.columns([1, 2])
-        mode = c1.selectbox(
-            "二创档位", MODES, key=tkey("cfg_mode"),
+        mode = st.segmented_control(
+            "二创档位", MODES, required=True, key=tkey("cfg_mode"),
             format_func=lambda m: MODE_LABELS.get(m, m),
+            width="stretch", wrap=True,
+        ) or "conservative"
+        c1, c2 = st.columns(2, gap="medium")
+        anchor = c1.text_area(
+            "全片统一设定", key=tkey("cfg_anchor"), height=110,
+            placeholder="人物 / 产品 / 风格锚点\n例如：25 岁女性，黑色长发，白色衬衫；产品是白色保温杯",
+            help="复刻原片的节奏和结构，但把人物、产品或画风固定成你写的样子；"
+                 "会写进每个镜头，拆解和生视频都会带上。留空表示完全照原片。",
         )
-        anchor = c2.text_area(
-            "全片统一设定（人物 / 产品 / 风格锚点）", key=tkey("cfg_anchor"),
-            placeholder="例如：25 岁女性，黑色长发，白色衬衫；产品是白色保温杯",
-        )
-        user_req = st.text_area(
-            "额外要求（可选）", key=tkey("cfg_user_req"),
+        user_req = c2.text_area(
+            "额外要求（可选）", key=tkey("cfg_user_req"), height=110,
             placeholder="例如：换成我的产品，保留原片节奏和卖点",
+            help="在复刻基础上额外要改的地方，比如换卖点、改口播、调整镜头顺序；"
+                 "只在拆解生成分镜时使用。留空表示只按原片复刻。",
+        )
+        st.caption(
+            "原片内容来自抽帧和口播；这两项只描述你要「固定」或「改成」的部分。"
         )
 
         ref_files = st.file_uploader(
@@ -978,11 +1120,22 @@ with center:
 
         refs = st.session_state.refs
         if refs:
+            shot_alias_sets = [
+                set(recreate.shot_aliases(shot)) for shot in st.session_state.shots
+            ]
             cols = st.columns(3)
             for i, ref in enumerate(refs):
+                used_count = sum(
+                    1 for aliases in shot_alias_sets if ref["alias"] in aliases
+                )
                 with cols[i % 3]:
                     st.image(
-                        ref["abs_path"], caption=f"@{ref['alias']}",
+                        ref["abs_path"],
+                        caption=(
+                            f"@{ref['alias']} · 已用于 {used_count} 个镜头"
+                            if used_count else
+                            f"@{ref['alias']} · 暂未被镜头引用"
+                        ),
                         width="stretch", alt=f"参考图 {ref['alias']}",
                     )
                     if st.button(
@@ -1008,11 +1161,15 @@ with center:
                             flash("success", f"已删除参考图 @{ref['alias']}")
                             st.rerun()
         else:
-            st.caption("还没有参考图。可上传人物、产品或风格参考图。")
-        st.caption(
-            "别名取文件名，例如 女主.png → @女主；在分镜表「参考附件」列填 @女主。"
-            "脚本和生视频会使用该引用。"
-        )
+            st.caption(
+                "可上传人物、产品或风格参考图；文件名就是别名，"
+                "如 女主.png → @女主。"
+            )
+        if refs:
+            st.caption(
+                "用法：点「拆解并生成脚本」时 AI 会先看参考图，并把 @别名 自动填进"
+                "分镜表「参考附件」列；也可以手动填写。生视频时会提交这些参考图。"
+            )
 
         if st.button("保存设定", key=tkey("save_meta")):
             folder = current_dir()
@@ -1021,38 +1178,45 @@ with center:
             else:
                 jobs.write_meta(folder, mode=mode, anchor=anchor, user_req=user_req)
                 st.session_state.meta = jobs.read_meta(folder)
-                st.success("设定已保存")
+                flash("success", "设定已保存")
+                st.rerun()
 
         source = usable_source()
         if source:
             st.divider()
             st.markdown("**抽帧与转写**")
-            c1, c2 = st.columns([1.1, 1])
+            frame_count = st.slider(
+                "分析帧数", 4, 12, 8, key=tkey("frame_count"),
+                help="均匀抽帧，帧越多拆解越细，模型调用也越贵",
+            )
+            c1, c2, c3 = st.columns(
+                [1.05, 1.15, 0.75], vertical_alignment="bottom"
+            )
             with c1:
-                frame_count = st.slider(
-                    "分析帧数", 4, 12, 8, key=tkey("frame_count"),
-                    help="均匀抽帧，帧越多拆解越细，模型调用也越贵",
-                )
-                do_transcribe = st.checkbox(
-                    "同时提取口播文案（较慢）", value=False,
-                    key=tkey("do_transcribe"),
-                )
-            with c2:
                 st.selectbox(
                     "语音识别模型", ["small", "base", "medium"], key="cfg_whisper",
                     format_func=lambda value: WHISPER_LABELS.get(value, value),
                     help="仅勾选口播转写时使用。",
                 )
-            if st.button(
-                "抽帧分析", type="primary", icon=":material/photo_library:",
-                key=tkey("extract"),
-            ):
+            with c2:
+                do_transcribe = st.checkbox(
+                    "同时提取口播文案（较慢）", value=False,
+                    key=tkey("do_transcribe"),
+                )
+            with c3:
+                extract_clicked = st.button(
+                    "抽帧分析", type="primary", icon=":material/photo_library:",
+                    key=tkey("extract"), width="stretch",
+                )
+            if extract_clicked:
                 try:
                     folder = ensure_job_dir()
                     with st.spinner("抽帧中..."):
                         frames = analyze.extract_frames(source, folder / "frames", frame_count)
                     st.session_state.frames = [(t, str(p)) for t, p in frames]
                     add_log(f"抽帧完成，共 {len(frames)} 帧")
+                    transcribe_done = 0
+                    transcribe_error = ""
                     if do_transcribe:
                         try:
                             with st.spinner("语音转写中，首次会下载语音模型..."):
@@ -1061,13 +1225,19 @@ with center:
                                 )
                             st.session_state.transcript = transcript
                             jobs.save_transcript(folder, transcript)
-                            add_log(f"转写完成，{len(transcript)} 句")
-                            st.success(f"转写完成，{len(transcript)} 句")
+                            transcribe_done = len(transcript)
+                            add_log(f"转写完成，{transcribe_done} 句")
                         except Exception as exc:
+                            transcribe_error = str(exc)
                             add_log(f"转写失败：{exc}")
-                            st.warning(str(exc))
-                    st.session_state.preview_section = "分镜 / 关键帧"
-                    st.success(f"抽帧完成，共 {len(frames)} 帧（预览见右侧）")
+                    set_preview("分镜 / 关键帧")
+                    message = f"抽帧完成，共 {len(frames)} 帧"
+                    if transcribe_done:
+                        message += f"；转写 {transcribe_done} 句"
+                    if transcribe_error:
+                        message += f"；转写失败：{transcribe_error}"
+                    flash("warning" if transcribe_error else "success", message)
+                    st.rerun()
                 except Exception as exc:
                     add_log(f"抽帧失败：{exc}")
                     st.error(str(exc))
@@ -1104,13 +1274,13 @@ with center:
                                 client(), analysis_model,
                                 [(t, Path(p)) for t, p in frames],
                                 mode, user_req, st.session_state.transcript,
-                                refs=st.session_state.refs,
+                                refs=st.session_state.refs, anchor=anchor,
                             )
                         shots = jobs.normalize_shots(shots)
                         st.session_state.shots = shots
                         st.session_state.last_raw = raw
                         save_shots(shots, mode, anchor, user_req)
-                        st.session_state.preview_section = "分镜 / 关键帧"
+                        set_preview("分镜 / 关键帧")
                         add_log(f"拆解完成，共 {len(shots)} 个镜头")
                         flash("success", f"拆解完成，共 {len(shots)} 个镜头，已保存分镜表和脚本")
                         bump_token()
@@ -1195,7 +1365,10 @@ with center:
 
             st.divider()
             st.markdown("**关键帧**")
-            c1, c2 = st.columns([1.3, 1])
+            keyframes = st.session_state.keyframe_urls
+            c1, c2, c3 = st.columns(
+                [1.25, 0.75, 1.0], vertical_alignment="bottom"
+            )
             with c1:
                 image_model = model_picker(
                     "生图模型", "cfg_image_model", cfg["image_model"], "image"
@@ -1205,11 +1378,13 @@ with center:
                     "画面比例", RATIO_OPTIONS, key="cfg_ratio",
                     format_func=lambda value: RATIO_LABELS.get(value, value),
                 )
-            keyframes = st.session_state.keyframe_urls
-            if st.button(
-                "生成关键帧（未生成的镜头）", type="primary",
-                icon=":material/image:", key=tkey("gen_keys"),
-            ):
+            with c3:
+                gen_keys = st.button(
+                    "生成关键帧（未生成的镜头）", type="primary",
+                    icon=":material/image:", key=tkey("gen_keys"),
+                    width="stretch",
+                )
+            if gen_keys:
                 if not image_model:
                     st.error("先选择生图模型")
                 else:
@@ -1238,7 +1413,7 @@ with center:
                             st.error(f"{sid} 生成失败：{exc}")
                         progress.progress((i + 1) / len(shots))
                     st.session_state.keyframe_urls = keyframes
-                    st.session_state.preview_section = "分镜 / 关键帧"
+                    set_preview("分镜 / 关键帧")
                     flash("success", "关键帧生成完成")
                     st.rerun()
 
@@ -1279,7 +1454,7 @@ with center:
                                     client().download(url, folder / "keys" / f"{sid}.png")
                                     jobs.save_keyframes(folder, keyframes)
                                 st.session_state.keyframe_urls = keyframes
-                                st.session_state.preview_section = "分镜 / 关键帧"
+                                set_preview("分镜 / 关键帧")
                                 add_log(f"关键帧 {sid} 重新生成完成")
                                 flash("success", f"{sid} 已重新生成")
                                 st.rerun()
@@ -1289,12 +1464,21 @@ with center:
 
             st.divider()
             st.markdown("**生成视频**")
-            c1, c2 = st.columns([1.3, 1])
+            c1, c2, c3 = st.columns(
+                [1.35, 0.85, 0.8], vertical_alignment="bottom"
+            )
             with c1:
                 video_model = model_picker(
                     "生视频模型", "cfg_video_model", cfg["video_model"], "video"
                 )
             with c2:
+                st.selectbox(
+                    "生成分辨率", RESOLUTION_OPTIONS, key="cfg_video_resolution",
+                    format_func=lambda value: RESOLUTION_LABELS.get(value, value),
+                    help="分辨率越高越清晰，计费也越高；不同模型支持档位不同，"
+                         "不支持时接口会直接报错。",
+                )
+            with c3:
                 st.number_input(
                     "单镜时长（秒）", min_value=4, max_value=30,
                     key="cfg_duration",
@@ -1302,13 +1486,11 @@ with center:
             ratio_label = RATIO_LABELS.get(
                 st.session_state.cfg_ratio, st.session_state.cfg_ratio
             )
-            st.caption(f"画面比例：{ratio_label}（在上方关键帧设置里修改）")
-            shot_ids = [shot.get("id", f"shot_{i + 1:02d}") for i, shot in enumerate(shots)]
-            selected = st.multiselect(
-                "选择要生成的镜头", shot_ids, default=shot_ids,
-                key=f"selected_{token}_{st.session_state.shots_nonce}",
-                placeholder="请选择镜头",
+            st.caption(
+                f"画面比例：{ratio_label}（在上方关键帧设置里修改）；"
+                "生成分辨率按所选模型档位计费，fast / mini 通常只支持 480P / 720P。"
             )
+            shot_ids = [shot.get("id", f"shot_{i + 1:02d}") for i, shot in enumerate(shots)]
             has_first = any(st.session_state.keyframe_urls.get(sid) for sid in shot_ids)
             use_first_key = tkey("use_first")
             if not has_first:
@@ -1321,10 +1503,19 @@ with center:
             st.caption(
                 "填写了 @参考图的镜头会优先用参考图生成，首帧设置对这些镜头不生效。"
             )
-            if st.button(
-                "生成选中镜头的视频", type="primary", icon=":material/movie:",
-                key=tkey("gen_videos"),
-            ):
+            c1, c2 = st.columns([1.65, 1], vertical_alignment="bottom")
+            with c1:
+                selected = st.multiselect(
+                    "选择要生成的镜头", shot_ids, default=shot_ids,
+                    key=f"selected_{token}_{st.session_state.shots_nonce}",
+                    placeholder="请选择镜头",
+                )
+            with c2:
+                gen_videos = st.button(
+                    "生成选中镜头的视频", type="primary", icon=":material/movie:",
+                    key=tkey("gen_videos"), width="stretch",
+                )
+            if gen_videos:
                 if not video_model:
                     st.error("先选择生视频模型")
                 elif not selected:
@@ -1341,23 +1532,10 @@ with center:
                         )
                         if shot is None:
                             continue
-                        matched = recreate.match_shot_refs(
-                            shot, st.session_state.refs
-                        )
-                        used_refs, ref_urls, total_bytes = [], [], 0
-                        for ref in matched:
-                            try:
-                                size = Path(ref["abs_path"]).stat().st_size
-                                if total_bytes + size > MAX_REF_TOTAL:
-                                    raise ValueError("参考图总大小超过 12MB")
-                                url = ref_data_url(Path(ref["abs_path"]))
-                            except Exception as exc:
-                                add_log(f"{sid} 参考图跳过 @{ref['alias']}：{exc}")
-                                st.warning(f"{sid} 参考图 @{ref['alias']} 跳过：{exc}")
-                                continue
-                            total_bytes += size
-                            used_refs.append(ref)
-                            ref_urls.append(url)
+                        used_refs, ref_urls, warnings = shot_ref_payload(shot)
+                        for warning in warnings:
+                            add_log(f"{sid} 参考图 {warning}")
+                            st.warning(f"{sid} 参考图 {warning}")
                         aliases = [ref["alias"] for ref in used_refs]
                         fallback_first = (
                             st.session_state.keyframe_urls.get(sid)
@@ -1365,13 +1543,14 @@ with center:
                         )
                         fallback_first = fallback_first or None
                         first = None if ref_urls else fallback_first
-                        prompt = recreate.video_prompt(shot, aliases)
+                        prompt = recreate.video_prompt(shot, aliases, anchor)
                         duration = max(4, min(30, int(round(float(
                             shot.get("duration") or st.session_state.cfg_duration
                         )))))
+                        resolution = st.session_state.cfg_video_resolution
                         add_log(
-                            f"{sid} 提交生成"
-                            + ("（参考图）" if ref_urls else "（首帧）" if first else "（文生视频）")
+                            f"{sid} 提交生成（{resolution}）"
+                            + ("；参考图" if ref_urls else "；首帧" if first else "；文生视频")
                         )
                         try:
                             with st.status(f"{sid} 提交生成...", expanded=False) as status:
@@ -1380,6 +1559,7 @@ with center:
                                         video_model, prompt, duration=duration,
                                         ratio=st.session_state.cfg_ratio,
                                         images=ref_urls or None, first_frame=first,
+                                        resolution=resolution,
                                     )
                                 except Api88Error as exc:
                                     if not ref_urls or exc.status not in {400, 413, 415, 422}:
@@ -1396,6 +1576,7 @@ with center:
                                         video_model, prompt, duration=duration,
                                         ratio=st.session_state.cfg_ratio,
                                         first_frame=fallback_first,
+                                        resolution=resolution,
                                     )
                                 status.update(label=f"{sid} 生成中，任务 {vid}")
 
@@ -1421,7 +1602,7 @@ with center:
                             add_log(f"{sid} 生成失败：{exc}")
                             st.error(f"{sid} 生成失败：{exc}")
                     if done:
-                        st.session_state.preview_section = "分镜 / 关键帧"
+                        set_preview("分镜 / 关键帧")
                         flash(
                             "success",
                             f"本次完成 {done} 个镜头"
@@ -1431,7 +1612,7 @@ with center:
 
     # ---------- 03 合成去重 ----------
     with st.container(border=True, key="sec_compose"):
-        st.subheader("03 合成去重")
+        st.subheader("03 合成去重", icon=":material/movie:")
         folder = current_dir()
         clips_dir = folder / "clips" if folder else None
         shots = st.session_state.shots
@@ -1530,7 +1711,7 @@ with center:
                         add_log(f"去重完成：{current.name}")
 
                     st.session_state.final_path = str(current)
-                    st.session_state.preview_section = "成片"
+                    set_preview("成片")
                     add_log(f"成片完成：{current.name}")
                     flash("success", f"成片完成：{current.name}")
                     st.rerun()

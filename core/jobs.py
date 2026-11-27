@@ -261,6 +261,8 @@ def job_status(d: Path) -> tuple[str, str]:
         return "关键帧", "violet"
     if (d / "shots.json").is_file():
         return "已拆解", "orange"
+    if _nonempty_files(d / "frames", "frame_*"):
+        return "已抽帧", "blue"
     if find_source(d):
         return "有素材", "gray"
     return "空", "gray"

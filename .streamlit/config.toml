@@ -1,2 +1,35 @@
 [client]
 toolbarMode = "minimal"
+
+[theme]
+base = "light"
+primaryColor = "#C63D3D"
+backgroundColor = "#F6F7F9"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#1C2024"
+borderColor = "#E1E4E8"
+linkColor = "#B83232"
+codeTextColor = "#1C2024"
+codeBackgroundColor = "#F1F3F5"
+font = "'Segoe UI', 'Microsoft YaHei', sans-serif"
+headingFont = "'Segoe UI Semibold', 'Microsoft YaHei', sans-serif"
+codeFont = "'Cascadia Code', 'Consolas', monospace"
+baseFontSize = 15
+baseRadius = "12px"
+buttonRadius = "10px"
+showWidgetBorder = true
+showSidebarBorder = false
+paddingTop = "2rem"
+paddingBottom = "3rem"
+headingFontSizes = ["28px", "22px", "19px", "16px", "15px", "13px"]
+headingFontWeights = [650, 600, 600, 600, 500, 500]
+
+[theme.sidebar]
+backgroundColor = "#EEF1F4"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#1C2024"
+borderColor = "#DDE2E7"
+primaryColor = "#C63D3D"
+linkColor = "#B83232"
+paddingTop = "1rem"
+paddingBottom = "1rem"
